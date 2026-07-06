@@ -1,20 +1,29 @@
-# GST Reconciliation Desk
+# GST Books Builder
 
-A zero-cost local prototype for GST register cleanup, validation, reconciliation, and Excel reporting.
+A zero-cost Streamlit prototype for turning bills, vouchers, registers, and bank statements into reviewed GST purchase and sales records.
 
 ## What It Does
 
-- Upload sales register files as CSV/XLS/XLSX.
-- Upload purchase/books files as CSV/XLS/XLSX.
-- Upload GSTR-2B or counterparty files as CSV/XLS/XLSX.
-- Add manual purchase and sales bills.
-- Upload bank statements and manually classify bank credits as sales receipts.
-- Upload PDF, DOCX, TXT, JPG, and PNG bills/vouchers for review.
-- Normalizes common GST column names into one clean format.
-- Flags practical GST data issues.
-- Reconciles purchase/books data against GSTR-2B-style data.
-- Matches reviewed bank sales receipts against sales invoices by amount and date.
-- Exports a review workbook with clean data, issues, and reconciliation.
+- Upload purchase registers, sales registers, GSTR-2B files, bank statements, and bill/voucher documents.
+- Extract selectable text from PDF/DOCX/TXT bills and vouchers.
+- Accept JPG/PNG files for manual review and preview.
+- Review extracted rows before saving them as purchase or sales records.
+- Keep purchase records and sales records separate.
+- Manually add purchase and sales records.
+- Categorize bank entries without treating every credit as sales.
+- Match sales invoices to bank credits categorized as `Sales receipt`.
+- Match purchase bills to bank debits categorized as `Vendor payment`.
+- Highlight possible unrecorded sales and missing purchase bills in Exceptions.
+- Export a GST-ready review workbook.
+
+## Accounting Rule
+
+The app does not calculate sales blindly from bank credits.
+
+- Confirmed sales = approved sales records.
+- Possible bank sales = bank credits manually categorized as `Sales receipt`.
+- Possible unrecorded sales = `Sales receipt` bank credits not matched to approved sales records.
+- Possible bank sales are not included in output tax until converted into approved sales records.
 
 ## Run
 
@@ -26,34 +35,13 @@ python -m streamlit run app.py
 
 See `DEPLOY_STREAMLIT.md` for Streamlit Community Cloud deployment steps.
 
-## Billing Workflow
+## Persistence
 
-Manual entries and reviewed bank categories are saved locally under `data/`. On Streamlit Community Cloud this storage is session/runtime-local, so use exports as the durable handoff for now.
+Manual purchase records, sales records, and reviewed bank categories are saved locally under `data/`. On Streamlit Community Cloud this storage is runtime-local, so use exports as the durable handoff for now.
 
-PDF and DOCX extraction works when documents contain selectable text. JPG/PNG files are accepted into the review workflow, but true OCR is intentionally left for a later phase.
+## Current Limits
 
-## Expected Columns
-
-The app accepts common names and aliases for:
-
-- GSTIN
-- Party / Supplier / Customer / Vendor Name
-- Invoice No
-- Invoice Date
-- Place of Supply
-- Taxable Value
-- IGST
-- CGST
-- SGST
-- Cess
-- Total / Invoice Value
-
-## Deliberately Skipped In This Version
-
-- Login and user roles.
-- OCR for scanned images and image-only PDFs.
-- Cloud database and hosting.
-- GSTN/GSP filing integration.
-- Paid AI APIs.
-
-Those can be added after real sample files prove which workflow matters most.
+- OCR is not included yet for scanned PDFs or image-only bills.
+- Legacy `.doc` files need conversion to `.docx`.
+- No login, billing, direct GST filing, or GSTN/GSP integration.
+- No paid AI APIs.
