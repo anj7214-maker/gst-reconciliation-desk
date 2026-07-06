@@ -1,13 +1,19 @@
 import pandas as pd
 
 from gst_rules import (
+    build_exceptions,
     calculate_gst,
     document_review_to_transactions,
+    document_review_to_purchase_sales,
     extract_document_fields,
+    gst_books_summary,
     gst_summary,
     match_sales_receipts,
+    match_vendor_payments,
     normalize_bank_statement,
     normalize_register,
+    register_to_purchase_records,
+    register_to_sales_records,
     reconcile_registers,
     validate_register,
 )
@@ -73,7 +79,8 @@ def test_bank_normalization_and_classification():
 
     result = normalize_bank_statement(raw)
 
-    assert result.frame.loc[0, "suggested_category"] == "Possible sales receipt"
+    assert result.frame.loc[0, "suggested_category"] == "Possible receipt"
+    assert result.frame.loc[0, "category"] == "Needs review"
     assert result.frame.loc[1, "suggested_category"] == "Bank charges"
 
 
@@ -171,3 +178,147 @@ def test_approved_document_review_becomes_transaction():
     assert result.loc[0, "source"] == "Document: voucher.docx"
     assert result.loc[0, "invoice_type"] == "Purchase"
     assert result.loc[0, "total"] == 1180
+
+
+def test_register_split_to_purchase_and_sales_records():
+    raw = pd.DataFrame(
+        [
+            {
+                "GSTIN": "07ABCDE1234F1Z5",
+                "Party Name": "Party",
+                "Invoice No": "A1",
+                "Invoice Date": "2026-04-01",
+                "Taxable Value": 1000,
+                "CGST": 90,
+                "SGST": 90,
+                "Total": 1180,
+            }
+        ]
+    )
+
+    normalized = normalize_register(raw, source="upload", invoice_type="Purchase").frame
+    purchases = register_to_purchase_records(normalized)
+    sales = register_to_sales_records(normalized)
+
+    assert purchases.loc[0, "supplier_name"] == "Party"
+    assert sales.loc[0, "customer_name"] == "Party"
+
+
+def test_document_review_approval_splits_purchase_and_sales_records():
+    review = pd.DataFrame(
+        [
+            {
+                "file_name": "purchase.pdf",
+                "save_as": "Purchase",
+                "gstin": "07ABCDE1234F1Z5",
+                "party_name": "Vendor",
+                "invoice_no": "P1",
+                "invoice_date": "2026-04-01",
+                "taxable_value": 1000,
+                "igst": 0,
+                "cgst": 90,
+                "sgst": 90,
+                "cess": 0,
+                "total": 1180,
+                "review_status": "Approve",
+            },
+            {
+                "file_name": "sales.pdf",
+                "save_as": "Sales",
+                "gstin": "",
+                "party_name": "Customer",
+                "invoice_no": "S1",
+                "invoice_date": "2026-04-02",
+                "taxable_value": 500,
+                "igst": 90,
+                "cgst": 0,
+                "sgst": 0,
+                "cess": 0,
+                "total": 590,
+                "review_status": "Approve",
+            },
+        ]
+    )
+
+    purchases, sales = document_review_to_purchase_sales(review)
+
+    assert len(purchases) == 1
+    assert len(sales) == 1
+    assert purchases.loc[0, "supplier_name"] == "Vendor"
+    assert sales.loc[0, "customer_name"] == "Customer"
+
+
+def test_vendor_payment_matching_and_unrecorded_sales_exception():
+    purchases = pd.DataFrame(
+        [
+            {
+                "purchase_id": "p1",
+                "source": "Manual purchase",
+                "supplier_name": "Vendor",
+                "supplier_gstin": "07ABCDE1234F1Z5",
+                "invoice_no": "P1",
+                "invoice_date": "2026-04-01",
+                "place_of_supply": "",
+                "taxable_value": 1000,
+                "igst": 0,
+                "cgst": 90,
+                "sgst": 90,
+                "cess": 0,
+                "total": 1180,
+                "itc_eligible": True,
+                "rcm_applicable": False,
+                "gstr_2b_match_status": "Not checked",
+                "bank_payment_status": "Unmatched",
+                "review_status": "Approved",
+            }
+        ]
+    )
+    sales = pd.DataFrame(
+        [
+            {
+                "sales_id": "s1",
+                "source": "Manual sales",
+                "customer_name": "Customer",
+                "customer_gstin": "",
+                "invoice_no": "S1",
+                "invoice_date": "2026-04-01",
+                "sale_type": "B2C",
+                "place_of_supply": "",
+                "taxable_value": 1000,
+                "igst": 0,
+                "cgst": 90,
+                "sgst": 90,
+                "cess": 0,
+                "total": 1180,
+                "payment_status": "Unmatched",
+                "bank_match_status": "Unmatched",
+                "review_status": "Approved",
+            }
+        ]
+    )
+    bank = pd.DataFrame(
+        [
+            {"entry_id": "b1", "date": "2026-04-03", "description": "vendor", "debit": 1180, "credit": 0, "category": "Vendor payment", "review_status": "Approved"},
+            {"entry_id": "b2", "date": "2026-04-04", "description": "unknown sale", "debit": 0, "credit": 999, "category": "Sales receipt", "review_status": "Approved"},
+        ]
+    )
+
+    purchase_matches = match_vendor_payments(purchases, bank)
+    sales_matches = match_sales_receipts(sales, bank)
+    exceptions = build_exceptions(purchases, sales, bank, sales_matches, purchase_matches, pd.DataFrame(), pd.DataFrame())
+
+    assert purchase_matches.loc[0, "match_status"] == "Matched"
+    assert "Possible unrecorded sales" in exceptions["section"].tolist()
+
+
+def test_gst_books_summary_calculation():
+    purchases = pd.DataFrame([{"review_status": "Approved", "total": 590, "igst": 0, "cgst": 45, "sgst": 45, "cess": 0}])
+    sales = pd.DataFrame([{"review_status": "Approved", "total": 1180, "igst": 0, "cgst": 90, "sgst": 90, "cess": 0}])
+    bank = pd.DataFrame([{"category": "Sales receipt", "credit": 1180}])
+    bank_review = pd.DataFrame([{"match_status": "Unmatched", "credit": 1180}])
+    summary = gst_books_summary(purchases, sales, bank, bank_review, pd.DataFrame(), pd.DataFrame())
+    lookup = dict(zip(summary["metric"], summary["value"], strict=False))
+
+    assert lookup["Output tax from sales records"] == 180
+    assert lookup["Input tax credit from purchase records"] == 90
+    assert lookup["Net GST payable"] == 90
