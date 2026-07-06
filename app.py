@@ -8,13 +8,16 @@ import streamlit as st
 from gst_rules import (
     BANK_COLUMNS,
     CANONICAL_COLUMNS,
+    DOCUMENT_COLUMNS,
     calculate_gst,
     concat_frames,
+    document_review_to_transactions,
     gst_summary,
     make_excel_report,
     manual_transaction,
     match_sales_receipts,
     read_bank_statement,
+    read_document_file,
     read_register,
     reconcile_registers,
     summary_metrics,
@@ -62,6 +65,11 @@ def main() -> None:
             accept_multiple_files=True,
         )
         bank_files = st.file_uploader("Bank statement files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+        document_files = st.file_uploader(
+            "Bills / vouchers",
+            type=["pdf", "docx", "doc", "txt", "jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+        )
 
     sales_uploaded, sales_warnings = load_register_files(sales_files, source_prefix="Sales", invoice_type="Sales")
     purchase_uploaded, purchase_warnings = load_register_files(
@@ -75,6 +83,7 @@ def main() -> None:
         invoice_type="Purchase",
     )
     bank_uploaded, bank_warnings = load_bank_files(bank_files)
+    document_review, document_warnings = load_document_files(document_files)
 
     bank_entries = merge_bank_entries(bank_saved, bank_uploaded)
     manual_sales = manual_saved[manual_saved["invoice_type"] == "Sales"] if not manual_saved.empty else manual_saved
@@ -90,7 +99,7 @@ def main() -> None:
     bank_review = match_sales_receipts(sales, bank_entries)
     summary_frame = gst_summary(sales, purchases, bank_review, issues)
 
-    render_warnings(sales_warnings + purchase_warnings + counterparty_warnings + bank_warnings)
+    render_warnings(sales_warnings + purchase_warnings + counterparty_warnings + bank_warnings + document_warnings)
     render_dashboard(sales, purchases, counterparty, issues, reconciliation, bank_review, summary_frame)
     render_tabs(
         sales_uploaded=sales_uploaded,
@@ -98,6 +107,8 @@ def main() -> None:
         counterparty=counterparty,
         manual_saved=manual_saved,
         bank_entries=bank_entries,
+        document_files=document_files,
+        document_review=document_review,
         all_registers=all_registers,
         issues=issues,
         reconciliation=reconciliation,
@@ -148,6 +159,22 @@ def load_bank_files(files) -> tuple[pd.DataFrame, list[str]]:
         except Exception as exc:  # pragma: no cover - Streamlit display path
             warnings.append(f"{file.name}: {exc}")
     return concat_frames(frames), warnings
+
+
+def load_document_files(files) -> tuple[pd.DataFrame, list[str]]:
+    frames: list[pd.DataFrame] = []
+    warnings: list[str] = []
+    for file in files or []:
+        try:
+            result = read_document_file(file)
+            frames.append(result.frame)
+            warnings.extend(result.warnings)
+        except Exception as exc:  # pragma: no cover - Streamlit display path
+            warnings.append(f"{file.name}: {exc}")
+    usable = [frame for frame in frames if not frame.empty]
+    if not usable:
+        return pd.DataFrame(columns=DOCUMENT_COLUMNS), warnings
+    return pd.concat(usable, ignore_index=True), warnings
 
 
 def merge_bank_entries(saved: pd.DataFrame, uploaded: pd.DataFrame) -> pd.DataFrame:
@@ -204,6 +231,8 @@ def render_tabs(
     counterparty: pd.DataFrame,
     manual_saved: pd.DataFrame,
     bank_entries: pd.DataFrame,
+    document_files,
+    document_review: pd.DataFrame,
     all_registers: pd.DataFrame,
     issues: pd.DataFrame,
     reconciliation: pd.DataFrame,
@@ -213,6 +242,7 @@ def render_tabs(
     tabs = st.tabs(
         [
             "Upload Registers",
+            "Documents",
             "Manual Entry",
             "Bank Statement",
             "GST Summary",
@@ -226,21 +256,24 @@ def render_tabs(
         render_upload_registers(sales_uploaded, purchase_uploaded, counterparty, all_registers)
 
     with tabs[1]:
-        render_manual_entry(manual_saved)
+        render_documents(document_files, document_review)
 
     with tabs[2]:
-        render_bank_statement(bank_entries, bank_review)
+        render_manual_entry(manual_saved)
 
     with tabs[3]:
-        render_gst_summary(summary_frame, bank_review)
+        render_bank_statement(bank_entries, bank_review)
 
     with tabs[4]:
-        render_validation(issues)
+        render_gst_summary(summary_frame, bank_review)
 
     with tabs[5]:
-        render_reconciliation(reconciliation)
+        render_validation(issues)
 
     with tabs[6]:
+        render_reconciliation(reconciliation)
+
+    with tabs[7]:
         st.download_button(
             "Download GST review workbook",
             data=make_excel_report(
@@ -251,6 +284,7 @@ def render_tabs(
                 bank_entries=bank_entries,
                 bank_sales_review=bank_review,
                 gst_summary_frame=summary_frame,
+                document_review=document_review,
             ),
             file_name="gst_review_workbook.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -277,6 +311,69 @@ def render_upload_registers(
     c2.metric("Purchase rows uploaded", len(purchase_uploaded))
     c3.metric("GSTR-2B rows uploaded", len(counterparty))
     st.dataframe(all_registers, use_container_width=True, hide_index=True)
+
+
+def render_documents(document_files, document_review: pd.DataFrame) -> None:
+    st.warning(
+        "PDF and Word extraction works only when text is selectable. JPG/PNG files are accepted for manual review; OCR comes later."
+    )
+    if document_review.empty:
+        st.info("Upload PDF, DOCX, TXT, JPG, or PNG bills/vouchers from the sidebar.")
+        st.dataframe(pd.DataFrame(columns=DOCUMENT_COLUMNS), use_container_width=True)
+        return
+
+    image_files = [file for file in document_files or [] if file.name.lower().endswith((".jpg", ".jpeg", ".png"))]
+    if image_files:
+        with st.expander("Image previews", expanded=False):
+            for file in image_files:
+                st.image(file, caption=file.name, use_container_width=True)
+
+    edited = st.data_editor(
+        document_review,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "review_status": st.column_config.SelectboxColumn(
+                "review_status",
+                options=["Needs review", "Approve", "Ignore"],
+                required=True,
+            ),
+            "invoice_type": st.column_config.SelectboxColumn(
+                "invoice_type",
+                options=["Purchase", "Sales"],
+                required=True,
+            ),
+            "document_type": st.column_config.SelectboxColumn(
+                "document_type",
+                options=[
+                    "Invoice",
+                    "Purchase invoice",
+                    "Sales invoice",
+                    "Payment voucher",
+                    "Receipt voucher",
+                    "Journal voucher",
+                    "Credit note",
+                    "Debit note",
+                    "Voucher",
+                    "Unknown",
+                ],
+                required=True,
+            ),
+        },
+        disabled=["file_name", "file_type", "extraction_status", "text_preview"],
+        key="document_review_editor",
+    )
+
+    approved_count = int((edited["review_status"] == "Approve").sum()) if "review_status" in edited else 0
+    if st.button(f"Save approved documents ({approved_count})"):
+        transactions = document_review_to_transactions(edited)
+        if transactions.empty:
+            st.info("Mark at least one document as Approve before saving.")
+            return
+        existing = load_csv(MANUAL_FILE, CANONICAL_COLUMNS)
+        save_csv(pd.concat([existing, transactions], ignore_index=True), MANUAL_FILE)
+        st.success("Approved document transactions saved into GST records.")
+        st.rerun()
 
 
 def render_manual_entry(manual_saved: pd.DataFrame) -> None:
