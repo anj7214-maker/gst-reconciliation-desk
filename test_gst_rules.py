@@ -2,6 +2,8 @@ import pandas as pd
 
 from gst_rules import (
     calculate_gst,
+    document_review_to_transactions,
+    extract_document_fields,
     gst_summary,
     match_sales_receipts,
     normalize_bank_statement,
@@ -118,3 +120,54 @@ def test_gst_summary_uses_sales_purchase_tax_and_bank_review():
     assert lookup["Output tax"] == 180
     assert lookup["Input tax credit"] == 90
     assert lookup["Net GST payable"] == 90
+
+
+def test_extract_document_fields_from_invoice_text():
+    text = """
+    Tax Invoice
+    Invoice No: INV-42
+    Date: 05-04-2026
+    GSTIN 07ABCDE1234F1Z5
+    Taxable Value 10000
+    CGST 900
+    SGST 900
+    Grand Total 11800
+    """
+
+    result = extract_document_fields(text, "invoice.pdf", "pdf")
+
+    assert result["document_type"] == "Invoice"
+    assert result["invoice_no"] == "INV-42"
+    assert result["gstin"] == "07ABCDE1234F1Z5"
+    assert result["taxable_value"] == 10000
+    assert result["total"] == 11800
+
+
+def test_approved_document_review_becomes_transaction():
+    review = pd.DataFrame(
+        [
+            {
+                "file_name": "voucher.docx",
+                "document_type": "Payment voucher",
+                "invoice_type": "Purchase",
+                "gstin": "07ABCDE1234F1Z5",
+                "party_name": "Vendor",
+                "invoice_no": "PV-1",
+                "invoice_date": "2026-04-05",
+                "taxable_value": 1000,
+                "igst": 0,
+                "cgst": 90,
+                "sgst": 90,
+                "cess": 0,
+                "total": 1180,
+                "review_status": "Approve",
+                "text_preview": "Payment voucher",
+            }
+        ]
+    )
+
+    result = document_review_to_transactions(review)
+
+    assert result.loc[0, "source"] == "Document: voucher.docx"
+    assert result.loc[0, "invoice_type"] == "Purchase"
+    assert result.loc[0, "total"] == 1180
