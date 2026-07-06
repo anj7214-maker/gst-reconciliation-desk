@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+import zipfile
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Iterable
+from xml.etree import ElementTree
 
 import pandas as pd
 
@@ -36,6 +38,26 @@ BANK_COLUMNS = [
     "category",
     "match_status",
     "matched_invoice_no",
+]
+
+DOCUMENT_COLUMNS = [
+    "file_name",
+    "file_type",
+    "document_type",
+    "invoice_type",
+    "gstin",
+    "party_name",
+    "invoice_no",
+    "invoice_date",
+    "taxable_value",
+    "igst",
+    "cgst",
+    "sgst",
+    "cess",
+    "total",
+    "extraction_status",
+    "review_status",
+    "text_preview",
 ]
 
 COLUMN_ALIASES = {
@@ -113,6 +135,9 @@ BANK_COLUMN_ALIASES = {
 }
 
 GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$")
+GSTIN_FIND_RE = re.compile(r"[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]")
+DATE_RE = re.compile(r"\b(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2})\b")
+AMOUNT_RE = re.compile(r"(?i)(?:rs\.?|inr|â‚¹)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)")
 
 
 @dataclass(frozen=True)
@@ -143,6 +168,30 @@ def read_bank_statement(uploaded_file) -> ImportResult:
         raise ValueError("Upload a CSV, XLS, or XLSX bank statement.")
 
     return normalize_bank_statement(raw)
+
+
+def read_document_file(uploaded_file) -> ImportResult:
+    file_name = uploaded_file.name
+    suffix = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    content = uploaded_file.getvalue()
+    warnings: list[str] = []
+
+    if suffix == "pdf":
+        text, warning = extract_pdf_text(content)
+    elif suffix in {"docx", "doc"}:
+        text, warning = extract_docx_text(content) if suffix == "docx" else ("", "Legacy .doc files need conversion to .docx first.")
+    elif suffix == "txt":
+        text, warning = decode_text(content), ""
+    elif suffix in {"jpg", "jpeg", "png"}:
+        text, warning = "", "Image uploaded for manual review. OCR is not included in the zero-cost version yet."
+    else:
+        text, warning = "", "Unsupported document format."
+
+    if warning:
+        warnings.append(f"{file_name}: {warning}")
+
+    row = extract_document_fields(text, file_name=file_name, file_type=suffix)
+    return ImportResult(pd.DataFrame([row], columns=DOCUMENT_COLUMNS), warnings)
 
 
 def normalize_register(raw: pd.DataFrame, source: str, invoice_type: str) -> ImportResult:
@@ -264,6 +313,24 @@ def manual_transaction(
         "bank_reference": bank_reference.strip(),
     }
     return pd.DataFrame([row])
+
+
+def document_review_to_transactions(review: pd.DataFrame) -> pd.DataFrame:
+    if review.empty:
+        return pd.DataFrame(columns=CANONICAL_COLUMNS)
+
+    approved = review[review["review_status"] == "Approve"].copy()
+    if approved.empty:
+        return pd.DataFrame(columns=CANONICAL_COLUMNS)
+
+    approved["source"] = "Document: " + approved["file_name"].fillna("").astype(str)
+    approved["place_of_supply"] = ""
+    for column in ["taxable_value", "igst", "cgst", "sgst", "cess", "total"]:
+        approved[column] = pd.to_numeric(approved[column], errors="coerce").fillna(0.0).round(2)
+    approved["gstin"] = approved["gstin"].map(clean_gstin)
+    approved["invoice_no"] = approved["invoice_no"].map(clean_invoice_no)
+    approved["invoice_date"] = pd.to_datetime(approved["invoice_date"], errors="coerce").dt.date
+    return approved[CANONICAL_COLUMNS + ["file_name", "document_type", "text_preview"]]
 
 
 def validate_register(frame: pd.DataFrame) -> pd.DataFrame:
@@ -488,6 +555,7 @@ def make_excel_report(
     bank_entries: pd.DataFrame | None = None,
     bank_sales_review: pd.DataFrame | None = None,
     gst_summary_frame: pd.DataFrame | None = None,
+    document_review: pd.DataFrame | None = None,
 ) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -505,6 +573,11 @@ def make_excel_report(
         (bank_sales_review if bank_sales_review is not None else pd.DataFrame()).to_excel(
             writer,
             sheet_name="Bank Sales Review",
+            index=False,
+        )
+        (document_review if document_review is not None else pd.DataFrame()).to_excel(
+            writer,
+            sheet_name="Document Review",
             index=False,
         )
         issues.to_excel(writer, sheet_name="Validation Issues", index=False)
@@ -546,6 +619,137 @@ def classify_bank_entry(row: pd.Series) -> str:
     if debit > 0:
         return "Possible payment/expense"
     return "Needs review"
+
+
+def extract_document_fields(text: str, file_name: str, file_type: str) -> dict:
+    normalized_text = normalize_text(text)
+    document_type = infer_document_type(normalized_text, file_name)
+    invoice_type = infer_invoice_type(normalized_text, document_type)
+    gstins = [match.group(0) for match in GSTIN_FIND_RE.finditer(normalized_text.replace(" ", "").upper())]
+
+    taxable = labeled_amount(normalized_text, ["taxable value", "taxable amount", "assessable value", "sub total"])
+    igst = labeled_amount(normalized_text, ["igst", "integrated tax"])
+    cgst = labeled_amount(normalized_text, ["cgst", "central tax"])
+    sgst = labeled_amount(normalized_text, ["sgst", "utgst", "state tax"])
+    cess = labeled_amount(normalized_text, ["cess"])
+    total = labeled_amount(normalized_text, ["grand total", "invoice value", "invoice total", "total amount", "total"])
+
+    if taxable == 0 and total > 0:
+        taxable = max(round(total - igst - cgst - sgst - cess, 2), 0.0)
+
+    return {
+        "file_name": file_name,
+        "file_type": file_type,
+        "document_type": document_type,
+        "invoice_type": invoice_type,
+        "gstin": gstins[0] if gstins else "",
+        "party_name": "",
+        "invoice_no": labeled_text(normalized_text, ["invoice no", "invoice number", "voucher no", "bill no", "receipt no"]),
+        "invoice_date": first_date(normalized_text),
+        "taxable_value": taxable,
+        "igst": igst,
+        "cgst": cgst,
+        "sgst": sgst,
+        "cess": cess,
+        "total": total,
+        "extraction_status": "Text extracted" if normalized_text else "Manual review needed",
+        "review_status": "Needs review",
+        "text_preview": normalized_text[:1200],
+    }
+
+
+def extract_pdf_text(content: bytes) -> tuple[str, str]:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return "", "PDF extraction needs pypdf. It is listed in requirements for Streamlit deployment."
+
+    try:
+        reader = PdfReader(BytesIO(content))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as exc:
+        return "", f"Could not read PDF text: {exc}"
+
+    if not text.strip():
+        return "", "No selectable PDF text found. Use image/manual review now; add OCR later."
+    return text, ""
+
+
+def extract_docx_text(content: bytes) -> tuple[str, str]:
+    try:
+        with zipfile.ZipFile(BytesIO(content)) as docx_zip:
+            xml = docx_zip.read("word/document.xml")
+    except Exception as exc:
+        return "", f"Could not read DOCX text: {exc}"
+
+    root = ElementTree.fromstring(xml)
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    text = "\n".join(node.text or "" for node in root.findall(".//w:t", namespace))
+    return text, "" if text.strip() else "No readable text found in DOCX."
+
+
+def decode_text(content: bytes) -> str:
+    for encoding in ["utf-8", "utf-16", "latin-1"]:
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return ""
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def infer_document_type(text: str, file_name: str) -> str:
+    lower = f"{file_name} {text}".lower()
+    if "credit note" in lower:
+        return "Credit note"
+    if "debit note" in lower:
+        return "Debit note"
+    if "payment voucher" in lower:
+        return "Payment voucher"
+    if "receipt voucher" in lower or "receipt" in lower:
+        return "Receipt voucher"
+    if "journal voucher" in lower:
+        return "Journal voucher"
+    if "voucher" in lower:
+        return "Voucher"
+    if "tax invoice" in lower or "invoice" in lower or "bill" in lower:
+        return "Invoice"
+    return "Unknown"
+
+
+def infer_invoice_type(text: str, document_type: str) -> str:
+    lower = text.lower()
+    if document_type in {"Payment voucher", "Journal voucher", "Voucher"}:
+        return "Purchase"
+    if "sales" in lower or "customer" in lower:
+        return "Sales"
+    return "Purchase"
+
+
+def labeled_text(text: str, labels: list[str]) -> str:
+    for label in labels:
+        pattern = rf"(?i){re.escape(label)}\s*[:#-]?\s*([A-Z0-9./_-]+)"
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def labeled_amount(text: str, labels: list[str]) -> float:
+    for label in labels:
+        pattern = rf"(?i){re.escape(label)}\s*[:#-]?\s*(?:rs\.?|inr|â‚¹)?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)"
+        match = re.search(pattern, text)
+        if match:
+            return money(match.group(1).replace(",", ""))
+    return 0.0
+
+
+def first_date(text: str) -> str:
+    match = DATE_RE.search(text)
+    return match.group(1) if match else ""
 
 
 def bank_entry_id(row: pd.Series) -> str:
