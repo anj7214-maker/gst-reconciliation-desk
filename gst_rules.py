@@ -24,6 +24,20 @@ CANONICAL_COLUMNS = [
     "total",
 ]
 
+BANK_COLUMNS = [
+    "entry_id",
+    "date",
+    "description",
+    "reference",
+    "debit",
+    "credit",
+    "balance",
+    "suggested_category",
+    "category",
+    "match_status",
+    "matched_invoice_no",
+]
+
 COLUMN_ALIASES = {
     "gstin": {
         "gstin",
@@ -82,6 +96,22 @@ COLUMN_ALIASES = {
     "total": {"total", "invoice value", "invoice amount", "gross total", "grand total", "amount"},
 }
 
+BANK_COLUMN_ALIASES = {
+    "date": {"date", "transaction date", "txn date", "value date", "posting date"},
+    "description": {
+        "description",
+        "narration",
+        "particulars",
+        "transaction remarks",
+        "remarks",
+        "details",
+    },
+    "reference": {"reference", "ref", "ref no", "cheque no", "utr", "transaction id", "chq/ref no"},
+    "debit": {"debit", "withdrawal", "withdrawals", "paid out", "dr", "debit amount"},
+    "credit": {"credit", "deposit", "deposits", "paid in", "cr", "credit amount"},
+    "balance": {"balance", "closing balance", "running balance"},
+}
+
 GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$")
 
 
@@ -101,6 +131,18 @@ def read_register(uploaded_file, source: str, invoice_type: str) -> ImportResult
         raise ValueError("Upload a CSV, XLS, or XLSX file.")
 
     return normalize_register(raw, source=source, invoice_type=invoice_type)
+
+
+def read_bank_statement(uploaded_file) -> ImportResult:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        raw = pd.read_csv(uploaded_file)
+    elif name.endswith((".xlsx", ".xls")):
+        raw = pd.read_excel(uploaded_file)
+    else:
+        raise ValueError("Upload a CSV, XLS, or XLSX bank statement.")
+
+    return normalize_bank_statement(raw)
 
 
 def normalize_register(raw: pd.DataFrame, source: str, invoice_type: str) -> ImportResult:
@@ -132,6 +174,96 @@ def normalize_register(raw: pd.DataFrame, source: str, invoice_type: str) -> Imp
             normalized[column] = pd.NA
 
     return ImportResult(normalized[CANONICAL_COLUMNS], warnings)
+
+
+def normalize_bank_statement(raw: pd.DataFrame) -> ImportResult:
+    warnings: list[str] = []
+    normalized = pd.DataFrame()
+    raw_columns = {clean_header(col): col for col in raw.columns}
+
+    for canonical, aliases in BANK_COLUMN_ALIASES.items():
+        source_column = next((raw_columns[a] for a in aliases if a in raw_columns), None)
+        if source_column is None:
+            normalized[canonical] = pd.NA
+            if canonical in {"date", "description", "debit", "credit"}:
+                warnings.append(f"Missing expected bank column: {canonical}")
+        else:
+            normalized[canonical] = raw[source_column]
+
+    normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce").dt.date
+    for column in ["debit", "credit", "balance"]:
+        normalized[column] = pd.to_numeric(normalized[column], errors="coerce").fillna(0.0).round(2)
+
+    normalized["description"] = normalized["description"].fillna("").astype(str)
+    normalized["reference"] = normalized["reference"].fillna("").astype(str)
+    normalized["entry_id"] = normalized.apply(bank_entry_id, axis=1)
+    normalized["suggested_category"] = normalized.apply(classify_bank_entry, axis=1)
+    normalized["category"] = normalized["suggested_category"].where(
+        normalized["suggested_category"].isin({"Ignore", "Bank charges"}),
+        "Needs review",
+    )
+    normalized["match_status"] = "Unmatched"
+    normalized["matched_invoice_no"] = ""
+
+    for column in BANK_COLUMNS:
+        if column not in normalized:
+            normalized[column] = pd.NA
+
+    return ImportResult(normalized[BANK_COLUMNS], warnings)
+
+
+def calculate_gst(taxable_value: object, gst_type: str, gst_rate: object, cess: object = 0) -> dict[str, float]:
+    taxable = money(taxable_value)
+    rate = money(gst_rate)
+    cess_amount = money(cess)
+    gst_amount = round(taxable * rate / 100, 2)
+
+    if gst_type == "IGST":
+        igst, cgst, sgst = gst_amount, 0.0, 0.0
+    else:
+        igst, cgst, sgst = 0.0, round(gst_amount / 2, 2), round(gst_amount / 2, 2)
+
+    total = round(taxable + igst + cgst + sgst + cess_amount, 2)
+    return {"igst": igst, "cgst": cgst, "sgst": sgst, "cess": cess_amount, "total": total}
+
+
+def manual_transaction(
+    invoice_type: str,
+    party_name: str,
+    gstin: str,
+    invoice_no: str,
+    invoice_date,
+    taxable_value: object,
+    gst_type: str,
+    gst_rate: object,
+    cess: object,
+    notes: str = "",
+    payment_received: bool | None = None,
+    bank_reference: str = "",
+) -> pd.DataFrame:
+    tax = calculate_gst(taxable_value, gst_type, gst_rate, cess)
+    source = f"Manual {invoice_type}"
+    row = {
+        "source": source,
+        "invoice_type": invoice_type,
+        "gstin": clean_gstin(gstin),
+        "party_name": party_name.strip(),
+        "invoice_no": clean_invoice_no(invoice_no),
+        "invoice_date": invoice_date,
+        "place_of_supply": "",
+        "taxable_value": money(taxable_value),
+        "igst": tax["igst"],
+        "cgst": tax["cgst"],
+        "sgst": tax["sgst"],
+        "cess": tax["cess"],
+        "total": tax["total"],
+        "gst_type": gst_type,
+        "gst_rate": money(gst_rate),
+        "notes": notes.strip(),
+        "payment_received": payment_received,
+        "bank_reference": bank_reference.strip(),
+    }
+    return pd.DataFrame([row])
 
 
 def validate_register(frame: pd.DataFrame) -> pd.DataFrame:
@@ -280,18 +412,166 @@ def summary_metrics(frame: pd.DataFrame) -> dict[str, float]:
     }
 
 
+def match_sales_receipts(sales: pd.DataFrame, bank_entries: pd.DataFrame, tolerance: float = 2.0) -> pd.DataFrame:
+    bank_sales = bank_entries[bank_entries.get("category", "") == "Sales receipt"].copy()
+    if bank_sales.empty:
+        return empty_bank_review()
+
+    sales_rows = sales.copy()
+    if not sales_rows.empty:
+        sales_rows["invoice_date"] = pd.to_datetime(sales_rows["invoice_date"], errors="coerce")
+
+    reviews: list[dict] = []
+    for _, bank_row in bank_sales.iterrows():
+        credit = money(bank_row.get("credit"))
+        bank_date = pd.to_datetime(bank_row.get("date"), errors="coerce")
+        candidates = pd.DataFrame()
+        if not sales_rows.empty:
+            candidates = sales_rows[(sales_rows["total"].sub(credit).abs() <= tolerance)].copy()
+            if not candidates.empty and not pd.isna(bank_date):
+                candidates["date_gap"] = (candidates["invoice_date"] - bank_date).abs().dt.days
+                close_candidates = candidates[candidates["date_gap"] <= 7]
+                if not close_candidates.empty:
+                    candidates = close_candidates.sort_values(["date_gap", "invoice_no"])
+
+        if candidates.empty:
+            status, invoice_no, party_name = "Unmatched", "", ""
+        else:
+            match = candidates.iloc[0]
+            status = "Matched"
+            invoice_no = match.get("invoice_no", "")
+            party_name = match.get("party_name", "")
+
+        reviews.append(
+            {
+                "entry_id": bank_row.get("entry_id", ""),
+                "date": bank_row.get("date", ""),
+                "description": bank_row.get("description", ""),
+                "credit": credit,
+                "category": bank_row.get("category", ""),
+                "match_status": status,
+                "matched_invoice_no": invoice_no,
+                "matched_party": party_name,
+            }
+        )
+
+    return pd.DataFrame(reviews)
+
+
+def gst_summary(sales: pd.DataFrame, purchases: pd.DataFrame, bank_review: pd.DataFrame, issues: pd.DataFrame) -> pd.DataFrame:
+    sales_summary = summary_metrics(sales)
+    purchase_summary = summary_metrics(purchases)
+    possible_bank_sales = money(bank_review[bank_review["category"] == "Sales receipt"]["credit"].sum()) if not bank_review.empty else 0.0
+    unmatched_bank_sales = (
+        int((bank_review["match_status"] == "Unmatched").sum()) if not bank_review.empty and "match_status" in bank_review else 0
+    )
+    output_tax = sales_summary["Output/Input Tax"]
+    input_tax = purchase_summary["Output/Input Tax"]
+    rows = [
+        ("Approved sales invoice total", sales_summary["Invoice Total"]),
+        ("Possible bank sales receipts", possible_bank_sales),
+        ("Approved purchase total", purchase_summary["Invoice Total"]),
+        ("Output tax", output_tax),
+        ("Input tax credit", input_tax),
+        ("Net GST payable", output_tax - input_tax),
+        ("Validation issues", float(len(issues))),
+        ("Unmatched bank sales receipts", float(unmatched_bank_sales)),
+    ]
+    return pd.DataFrame(rows, columns=["metric", "value"])
+
+
 def make_excel_report(
     normalized: pd.DataFrame,
     issues: pd.DataFrame,
     reconciliation: pd.DataFrame,
+    manual_transactions: pd.DataFrame | None = None,
+    bank_entries: pd.DataFrame | None = None,
+    bank_sales_review: pd.DataFrame | None = None,
+    gst_summary_frame: pd.DataFrame | None = None,
 ) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         normalized.to_excel(writer, sheet_name="Clean Register", index=False)
+        (manual_transactions if manual_transactions is not None else pd.DataFrame()).to_excel(
+            writer,
+            sheet_name="Manual Transactions",
+            index=False,
+        )
+        (bank_entries if bank_entries is not None else pd.DataFrame()).to_excel(
+            writer,
+            sheet_name="Bank Entries",
+            index=False,
+        )
+        (bank_sales_review if bank_sales_review is not None else pd.DataFrame()).to_excel(
+            writer,
+            sheet_name="Bank Sales Review",
+            index=False,
+        )
         issues.to_excel(writer, sheet_name="Validation Issues", index=False)
         reconciliation.to_excel(writer, sheet_name="Reconciliation", index=False)
+        (gst_summary_frame if gst_summary_frame is not None else pd.DataFrame()).to_excel(
+            writer,
+            sheet_name="GST Summary",
+            index=False,
+        )
     output.seek(0)
     return output.getvalue()
+
+
+def classify_bank_entry(row: pd.Series) -> str:
+    description = str(row.get("description") or "").lower()
+    debit = money(row.get("debit"))
+    credit = money(row.get("credit"))
+    ignore_keywords = ["self", "transfer", "upi transfer", "neft transfer", "imps transfer"]
+    charge_keywords = ["charge", "charges", "fee", "fees"]
+    gst_keywords = ["gst", "goods and services tax"]
+    loan_keywords = ["loan"]
+    salary_keywords = ["salary", "wages"]
+    interest_keywords = ["interest"]
+
+    if any(word in description for word in charge_keywords):
+        return "Bank charges"
+    if any(word in description for word in gst_keywords):
+        return "GST payment"
+    if any(word in description for word in loan_keywords):
+        return "Loan"
+    if any(word in description for word in salary_keywords):
+        return "Needs review"
+    if any(word in description for word in ignore_keywords):
+        return "Ignore"
+    if any(word in description for word in interest_keywords):
+        return "Needs review"
+    if credit > 0:
+        return "Possible sales receipt"
+    if debit > 0:
+        return "Possible payment/expense"
+    return "Needs review"
+
+
+def bank_entry_id(row: pd.Series) -> str:
+    parts = [
+        str(row.get("date") or ""),
+        str(row.get("description") or ""),
+        str(row.get("reference") or ""),
+        f"{money(row.get('debit')):.2f}",
+        f"{money(row.get('credit')):.2f}",
+    ]
+    return str(abs(hash("|".join(parts))))
+
+
+def empty_bank_review() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "entry_id",
+            "date",
+            "description",
+            "credit",
+            "category",
+            "match_status",
+            "matched_invoice_no",
+            "matched_party",
+        ]
+    )
 
 
 def clean_header(value: object) -> str:
