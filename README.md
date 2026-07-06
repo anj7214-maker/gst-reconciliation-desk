@@ -4,9 +4,9 @@ A zero-cost Streamlit prototype for turning bills, vouchers, registers, and bank
 
 ## What It Does
 
-- Upload purchase registers, sales registers, GSTR-2B files, bank statements, and bill/voucher documents.
+- Upload purchase registers, sales registers, GSTR-2B files, bank statements, and bill/voucher documents, including PDFs.
 - Extract selectable text from PDF/DOCX/TXT bills and vouchers.
-- Accept JPG/PNG files for manual review and preview.
+- Run OCR on scanned PDFs and JPG/PNG files when Tesseract is available.
 - Review extracted rows before saving them as purchase or sales records.
 - Keep purchase records and sales records separate.
 - Manually add purchase and sales records.
@@ -41,7 +41,7 @@ Manual purchase records, sales records, and reviewed bank categories are saved l
 
 ## Current Limits
 
-- OCR is not included yet for scanned PDFs or image-only bills.
+- OCR quality depends on scan quality, Poppler, and Tesseract availability.
 - Legacy `.doc` files need conversion to `.docx`.
 - No login, billing, direct GST filing, or GSTN/GSP integration.
 - No paid AI APIs.
