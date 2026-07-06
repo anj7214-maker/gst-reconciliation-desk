@@ -8,6 +8,7 @@ from typing import Iterable
 from xml.etree import ElementTree
 
 import pandas as pd
+from PIL import Image
 
 
 CANONICAL_COLUMNS = [
@@ -196,8 +197,12 @@ def read_register(uploaded_file, source: str, invoice_type: str) -> ImportResult
         raw = pd.read_csv(uploaded_file)
     elif name.endswith((".xlsx", ".xls")):
         raw = pd.read_excel(uploaded_file)
+    elif name.endswith(".pdf"):
+        result = read_document_file(uploaded_file)
+        result.frame["save_as"] = invoice_type
+        return document_review_to_register_import(result.frame, source=source, invoice_type=invoice_type, warnings=result.warnings)
     else:
-        raise ValueError("Upload a CSV, XLS, or XLSX file.")
+        raise ValueError("Upload a CSV, XLS, XLSX, or PDF file.")
 
     return normalize_register(raw, source=source, invoice_type=invoice_type)
 
@@ -208,8 +213,10 @@ def read_bank_statement(uploaded_file) -> ImportResult:
         raw = pd.read_csv(uploaded_file)
     elif name.endswith((".xlsx", ".xls")):
         raw = pd.read_excel(uploaded_file)
+    elif name.endswith(".pdf"):
+        return read_bank_pdf(uploaded_file)
     else:
-        raise ValueError("Upload a CSV, XLS, or XLSX bank statement.")
+        raise ValueError("Upload a CSV, XLS, XLSX, or PDF bank statement.")
 
     return normalize_bank_statement(raw)
 
@@ -227,7 +234,7 @@ def read_document_file(uploaded_file) -> ImportResult:
     elif suffix == "txt":
         text, warning = decode_text(content), ""
     elif suffix in {"jpg", "jpeg", "png"}:
-        text, warning = "", "Image uploaded for manual review. OCR is not included in the zero-cost version yet."
+        text, warning = extract_image_text(content)
     else:
         text, warning = "", "Unsupported document format."
 
@@ -236,6 +243,41 @@ def read_document_file(uploaded_file) -> ImportResult:
 
     row = extract_document_fields(text, file_name=file_name, file_type=suffix)
     return ImportResult(pd.DataFrame([row], columns=DOCUMENT_COLUMNS), warnings)
+
+
+def read_bank_pdf(uploaded_file) -> ImportResult:
+    text, warning = extract_pdf_text(uploaded_file.getvalue())
+    bank_frame = bank_entries_from_text(text)
+    warnings = [f"{uploaded_file.name}: {warning}"] if warning else []
+    if bank_frame.empty:
+        warnings.append(f"{uploaded_file.name}: Could not detect bank rows from PDF text/OCR. Use CSV/XLSX or manual review.")
+    return ImportResult(bank_frame, warnings)
+
+
+def document_review_to_register_import(review: pd.DataFrame, source: str, invoice_type: str, warnings: list[str]) -> ImportResult:
+    if review.empty:
+        return ImportResult(pd.DataFrame(columns=CANONICAL_COLUMNS), warnings)
+
+    frame = pd.DataFrame(
+        {
+            "source": source,
+            "invoice_type": invoice_type,
+            "gstin": review["gstin"],
+            "party_name": review["party_name"],
+            "invoice_no": review["invoice_no"],
+            "invoice_date": pd.to_datetime(review["invoice_date"], errors="coerce").dt.date,
+            "place_of_supply": "",
+            "taxable_value": pd.to_numeric(review["taxable_value"], errors="coerce").fillna(0.0),
+            "igst": pd.to_numeric(review["igst"], errors="coerce").fillna(0.0),
+            "cgst": pd.to_numeric(review["cgst"], errors="coerce").fillna(0.0),
+            "sgst": pd.to_numeric(review["sgst"], errors="coerce").fillna(0.0),
+            "cess": pd.to_numeric(review["cess"], errors="coerce").fillna(0.0),
+            "total": pd.to_numeric(review["total"], errors="coerce").fillna(0.0),
+        }
+    )
+    if not warnings:
+        warnings = [f"{source}: PDF was converted into one extracted review row; verify fields before using."]
+    return ImportResult(frame[CANONICAL_COLUMNS], warnings)
 
 
 def normalize_register(raw: pd.DataFrame, source: str, invoice_type: str) -> ImportResult:
@@ -1094,19 +1136,77 @@ def extract_document_fields(text: str, file_name: str, file_type: str) -> dict:
 
 
 def extract_pdf_text(content: bytes) -> tuple[str, str]:
+    warnings: list[str] = []
     try:
         from pypdf import PdfReader
     except ImportError:
-        return "", "PDF extraction needs pypdf. It is listed in requirements for Streamlit deployment."
+        warnings.append("PDF text extraction needs pypdf. It is listed in requirements for Streamlit deployment.")
+        text = ""
+    else:
+        try:
+            reader = PdfReader(BytesIO(content))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception as exc:
+            warnings.append(f"Could not read selectable PDF text: {exc}")
+            text = ""
+
+    if text.strip():
+        return text, ""
+
+    ocr_text, ocr_warning = extract_pdf_ocr_text(content)
+    if ocr_text.strip():
+        warning = "Selectable PDF text not found; OCR text was used."
+        if warnings:
+            warning = " ".join(warnings + [warning])
+        return ocr_text, warning
+
+    warnings.append(ocr_warning or "No selectable or OCR-readable PDF text found.")
+    return "", " ".join(warnings)
+
+
+def extract_pdf_ocr_text(content: bytes) -> tuple[str, str]:
+    try:
+        from pdf2image import convert_from_bytes
+    except ImportError:
+        return "", "PDF OCR needs pdf2image. It is listed in requirements for Streamlit deployment."
 
     try:
-        reader = PdfReader(BytesIO(content))
-        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        pages = convert_from_bytes(content, dpi=200, first_page=1, last_page=3)
     except Exception as exc:
-        return "", f"Could not read PDF text: {exc}"
+        return "", f"PDF OCR needs Poppler/pdf rendering support: {exc}"
 
-    if not text.strip():
-        return "", "No selectable PDF text found. Use image/manual review now; add OCR later."
+    text_parts: list[str] = []
+    warnings: list[str] = []
+    for index, page in enumerate(pages, start=1):
+        text, warning = ocr_image(page)
+        if warning:
+            warnings.append(f"page {index}: {warning}")
+        text_parts.append(text)
+    return "\n".join(text_parts), "; ".join(warnings)
+
+
+def extract_image_text(content: bytes) -> tuple[str, str]:
+    try:
+        image = Image.open(BytesIO(content))
+    except Exception as exc:
+        return "", f"Could not read image for OCR: {exc}"
+    text, warning = ocr_image(image)
+    if text.strip():
+        return text, "Image OCR text was used; verify all fields."
+    return "", warning or "Image OCR returned no text. Review manually."
+
+
+def ocr_image(image: Image.Image) -> tuple[str, str]:
+    try:
+        import pytesseract
+    except ImportError:
+        return "", "OCR needs pytesseract. It is listed in requirements for Streamlit deployment."
+
+    try:
+        text = pytesseract.image_to_string(image)
+    except Exception as exc:
+        return "", f"OCR needs the Tesseract binary installed: {exc}"
+
     return text, ""
 
 
@@ -1185,6 +1285,35 @@ def labeled_amount(text: str, labels: list[str]) -> float:
 def first_date(text: str) -> str:
     match = DATE_RE.search(text)
     return match.group(1) if match else ""
+
+
+def bank_entries_from_text(text: str) -> pd.DataFrame:
+    rows: list[dict] = []
+    for line in (text or "").splitlines():
+        normalized = normalize_text(line)
+        if not normalized:
+            continue
+        date = first_date(normalized)
+        amounts = [money(match.group(1).replace(",", "")) for match in AMOUNT_RE.finditer(normalized)]
+        if not date or not amounts:
+            continue
+        amount = amounts[-1]
+        lower = normalized.lower()
+        debit = amount if any(token in lower for token in [" debit ", " dr ", "withdrawal", "paid"]) else 0.0
+        credit = amount if debit == 0.0 else 0.0
+        rows.append(
+            {
+                "date": date,
+                "description": normalized,
+                "reference": "",
+                "debit": debit,
+                "credit": credit,
+                "balance": 0.0,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=BANK_COLUMNS)
+    return normalize_bank_statement(pd.DataFrame(rows)).frame
 
 
 def bank_entry_id(row: pd.Series) -> str:
