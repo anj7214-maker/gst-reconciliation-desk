@@ -7,9 +7,12 @@ A zero-cost local prototype for GST register cleanup, validation, reconciliation
 - Upload sales register files as CSV/XLS/XLSX.
 - Upload purchase/books files as CSV/XLS/XLSX.
 - Upload GSTR-2B or counterparty files as CSV/XLS/XLSX.
+- Add manual purchase and sales bills.
+- Upload bank statements and manually classify bank credits as sales receipts.
 - Normalizes common GST column names into one clean format.
 - Flags practical GST data issues.
 - Reconciles purchase/books data against GSTR-2B-style data.
+- Matches reviewed bank sales receipts against sales invoices by amount and date.
 - Exports a review workbook with clean data, issues, and reconciliation.
 
 ## Run
@@ -21,6 +24,10 @@ python -m streamlit run app.py
 ## Deploy
 
 See `DEPLOY_STREAMLIT.md` for Streamlit Community Cloud deployment steps.
+
+## Billing Workflow
+
+Manual entries and reviewed bank categories are saved locally under `data/`. On Streamlit Community Cloud this storage is session/runtime-local, so use exports as the durable handoff for now.
 
 ## Expected Columns
 
