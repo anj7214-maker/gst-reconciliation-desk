@@ -1,6 +1,7 @@
 import pandas as pd
 
 from gst_rules import (
+    bank_entries_from_text,
     build_exceptions,
     calculate_gst,
     document_review_to_transactions,
@@ -322,3 +323,16 @@ def test_gst_books_summary_calculation():
     assert lookup["Output tax from sales records"] == 180
     assert lookup["Input tax credit from purchase records"] == 90
     assert lookup["Net GST payable"] == 90
+
+
+def test_bank_entries_from_pdf_text_lines():
+    text = """
+    01-04-2026 CUSTOMER RECEIPT CR 11,800.00
+    02-04-2026 VENDOR PAYMENT DR 5,900.00
+    """
+
+    result = bank_entries_from_text(text)
+
+    assert len(result) == 2
+    assert result.loc[0, "credit"] == 11800
+    assert result.loc[1, "debit"] == 5900
