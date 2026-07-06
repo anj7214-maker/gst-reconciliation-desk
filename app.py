@@ -148,28 +148,28 @@ def render_sources() -> dict:
     st.subheader("Sources")
     st.write("Upload bills, vouchers, registers, bank statements, and GSTR-2B files here.")
     st.warning(
-        "PDF/DOCX/TXT extraction works only for selectable text. JPG/PNG and scanned PDFs require manual review until OCR is added. Bank credits are not sales unless categorized."
+        "PDFs are supported across uploads. Selectable text is extracted first; scanned PDFs and images use OCR when Tesseract is available. Bank credits are not sales unless categorized."
     )
     c1, c2 = st.columns(2)
     with c1:
         purchase_registers = st.file_uploader(
             "Purchase bill/register files",
-            type=["csv", "xlsx", "xls"],
+            type=["csv", "xlsx", "xls", "pdf"],
             accept_multiple_files=True,
         )
         sales_registers = st.file_uploader(
             "Sales bill/register files",
-            type=["csv", "xlsx", "xls"],
+            type=["csv", "xlsx", "xls", "pdf"],
             accept_multiple_files=True,
         )
-        gstr_2b = st.file_uploader("GSTR-2B / counterparty files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+        gstr_2b = st.file_uploader("GSTR-2B / counterparty files", type=["csv", "xlsx", "xls", "pdf"], accept_multiple_files=True)
     with c2:
         documents = st.file_uploader(
             "PDF / Word / image bills and vouchers",
             type=["pdf", "docx", "doc", "txt", "jpg", "jpeg", "png"],
             accept_multiple_files=True,
         )
-        bank = st.file_uploader("Bank statements", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+        bank = st.file_uploader("Bank statements", type=["csv", "xlsx", "xls", "pdf"], accept_multiple_files=True)
     return {
         "purchase_registers": purchase_registers,
         "sales_registers": sales_registers,
@@ -270,7 +270,7 @@ def render_review_extraction(document_files, document_review: pd.DataFrame) -> N
     st.subheader("Review Extraction")
     st.caption("Approve rows only after checking the extracted bill/voucher fields.")
     if document_review.empty:
-        st.info("Upload PDF/DOCX/TXT/JPG/PNG bills or vouchers in Sources.")
+        st.info("Upload PDF/DOCX/TXT/JPG/PNG bills or vouchers in Sources. OCR is attempted for scanned PDFs and images when available.")
         st.dataframe(pd.DataFrame(columns=DOCUMENT_COLUMNS), use_container_width=True)
         return
 
